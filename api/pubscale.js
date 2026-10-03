@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const { initializeApp, getApps, cert } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
+const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_REWARD_COINS = 10_000_000;
 
 function getDb() {
@@ -20,22 +21,6 @@ function getDb() {
   return getFirestore();
 }
 
-function firstValue(source, names) {
-  for (const name of names) {
-    const value = source?.[name];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  }
-  return '';
-}
-
-function safeEqual(left, right) {
-  const leftBuffer = Buffer.from(left, 'utf8');
-  const rightBuffer = Buffer.from(right, 'utf8');
-  return leftBuffer.length === rightBuffer.length &&
-    crypto.timingSafeEqual(leftBuffer, rightBuffer);
-}
-
 function respond(res, status, payload) {
   res.setHeader('Cache-Control', 'no-store');
   return res.status(status).json(payload);
@@ -45,62 +30,126 @@ function logOutcome(outcome, details = {}) {
   console.info('[pubscale-postback]', JSON.stringify({ outcome, ...details }));
 }
 
+async function readRawBody(req) {
+  const chunks = [];
+  let totalBytes = 0;
+
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.length;
+    if (totalBytes > MAX_BODY_BYTES) {
+      const error = new Error('Request body too large');
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(buffer);
+  }
+
+  return Buffer.concat(chunks, totalBytes);
+}
+
+function getSignature(req) {
+  const value = req.headers?.['x-pubscale-signature'] ||
+    req.headers?.['x-signature'];
+  if (Array.isArray(value)) return value[0] || '';
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function verifySignature(rawBody, suppliedSignature, secret) {
+  const signatureHex = suppliedSignature.replace(/^sha256=/i, '').trim();
+  if (!/^[a-f0-9]{64}$/i.test(signatureHex)) return false;
+
+  const suppliedDigest = Buffer.from(signatureHex, 'hex');
+  const expectedDigest = crypto
+    .createHmac('sha256', secret)
+    .update(rawBody)
+    .digest();
+
+  return suppliedDigest.length === expectedDigest.length &&
+    crypto.timingSafeEqual(suppliedDigest, expectedDigest);
+}
+
+function parsePayload(rawBody, contentType = '') {
+  const type = contentType.toLowerCase();
+  const text = rawBody.toString('utf8');
+
+  if (type.includes('application/x-www-form-urlencoded')) {
+    return Object.fromEntries(new URLSearchParams(text));
+  }
+  if (!type.includes('application/json') && !type.includes('+json')) {
+    const error = new Error('Unsupported content type');
+    error.statusCode = 415;
+    throw error;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch (_) {
+    const error = new Error('Malformed JSON body');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    const error = new Error('JSON body must be an object');
+    error.statusCode = 400;
+    throw error;
+  }
+  return payload;
+}
+
+function firstValue(source, names) {
+  for (const name of names) {
+    const value = source?.[name];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return '';
+}
+
 module.exports = async function pubscalePostback(req, res) {
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    res.setHeader('Allow', 'GET, POST');
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
     return respond(res, 405, { ok: false, error: 'method_not_allowed' });
   }
 
+  const signatureSecret = process.env.PUBSCALE_POSTBACK_SECRET || '';
+  if (!signatureSecret) {
+    logOutcome('configuration_error', { reason: 'signature_secret_missing' });
+    return respond(res, 500, { ok: false, error: 'server_misconfigured' });
+  }
+
   try {
-    const body = req.body && typeof req.body === 'object' ? req.body : {};
-    const query = req.query || {};
-    const authorization = req.headers?.authorization || '';
-    const bearerToken = authorization.match(/^Bearer\s+(.+)$/i)?.[1] || '';
-    const suppliedToken = firstValue(body, ['token', 'auth_token', 'secret']) ||
-      firstValue(query, ['token', 'auth_token', 'secret']) || bearerToken;
-    const expectedToken = process.env.PUBSCALE_POSTBACK_TOKEN || '';
-
-    if (!expectedToken || !suppliedToken || !safeEqual(suppliedToken, expectedToken)) {
+    const rawBody = await readRawBody(req);
+    const signature = getSignature(req);
+    if (!signature || !verifySignature(rawBody, signature, signatureSecret)) {
       logOutcome('rejected', {
-        reason: 'unauthorized',
-        tokenConfigured: Boolean(expectedToken),
-        tokenProvided: Boolean(suppliedToken),
+        reason: 'invalid_signature',
+        signatureProvided: Boolean(signature),
       });
-      return respond(res, 401, { ok: false, error: 'unauthorized' });
+      return respond(res, 401, { ok: false, error: 'invalid_signature' });
     }
 
-    const userIdFromBody = firstValue(body, ['user_id', 'userId', 'uid']);
-    const userIdFromQuery = firstValue(query, ['user_id', 'userId', 'uid']);
-    const userId = userIdFromBody || userIdFromQuery;
-
-    let transactionId = firstValue(body, ['transaction_id', 'transactionId', 'trans_id', 'tx_id', 'id']) ||
-      firstValue(query, ['transaction_id', 'transactionId', 'trans_id', 'tx_id', 'id']);
-    
-    // Fallback if transactionId is missing from test panel
-    if (!transactionId) {
-      transactionId = 'test_tx_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-    }
-
-    const rewardFromBody = firstValue(body, ['value', 'reward', 'coins', 'amount', 'reward_value']);
-    const rewardFromQuery = firstValue(query, ['value', 'reward', 'coins', 'amount', 'reward_value']);
-    const rewardValue = rewardFromBody || rewardFromQuery;
+    const payload = parsePayload(rawBody, req.headers?.['content-type'] || '');
+    const userId = firstValue(payload, ['user_id', 'userId', 'uid']);
+    const transactionId = firstValue(payload, [
+      'transaction_id', 'transactionId', 'trans_id', 'tx_id', 'id',
+    ]);
+    const rewardValue = firstValue(payload, [
+      'value', 'reward', 'coins', 'amount', 'reward_value',
+    ]);
     const rewardCoins = Number(rewardValue);
-    
-    const parameterSources = {
-      userId: userIdFromBody ? 'body' : (userIdFromQuery ? 'query' : 'missing'),
-      transactionId: transactionId ? 'auto_or_provided' : 'missing',
-      reward: rewardFromBody ? 'body' : (rewardFromQuery ? 'query' : 'missing'),
-    };
 
     if (!userId || userId.length > 1500 || userId.includes('/') ||
+        !transactionId || transactionId.length > 500 ||
         !Number.isSafeInteger(rewardCoins) || rewardCoins < 1 ||
         rewardCoins > MAX_REWARD_COINS) {
       logOutcome('rejected', {
         reason: 'invalid_parameters',
         userIdProvided: Boolean(userId),
+        transactionIdProvided: Boolean(transactionId),
         rewardProvided: Boolean(rewardValue),
         rewardIsPositiveInteger: Number.isSafeInteger(rewardCoins) && rewardCoins > 0,
-        parameterSources,
       });
       return respond(res, 400, { ok: false, error: 'invalid_parameters' });
     }
@@ -160,18 +209,27 @@ module.exports = async function pubscalePostback(req, res) {
       logOutcome('rejected', { reason: outcome });
       return respond(res, 409, { ok: false, error: 'transaction_conflict' });
     }
-    logOutcome(outcome, {
-      transactionKey,
-      rewardCoins,
-      parameterSources,
-    });
+
+    logOutcome(outcome, { transactionKey, rewardCoins });
     return respond(res, 200, { ok: true, status: outcome });
   } catch (error) {
-    console.error('[pubscale-postback] processing_failed', {
-      code: error?.code || null,
-      name: error?.name || 'Error',
-      message: error?.message || 'Unknown error',
+    const statusCode = error.statusCode || 500;
+    if (statusCode >= 500) {
+      console.error('[pubscale-postback] processing_failed', {
+        code: error?.code || null,
+        name: error?.name || 'Error',
+        message: error?.message || 'Unknown error',
+      });
+    } else {
+      logOutcome('rejected', { reason: error.message, statusCode });
+    }
+    return respond(res, statusCode, {
+      ok: false,
+      error: statusCode === 500 ? 'internal_error' : 'invalid_request',
     });
-    return respond(res, 500, { ok: false, error: 'internal_error' });
   }
+};
+
+module.exports.config = {
+  api: { bodyParser: false },
 };
