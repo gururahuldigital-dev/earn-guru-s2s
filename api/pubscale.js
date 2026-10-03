@@ -30,14 +30,37 @@ function logOutcome(outcome, details = {}) {
   console.info('[pubscale-postback]', JSON.stringify({ outcome, ...details }));
 }
 
-async function readRawBody(req) {
-  const chunks = [];
-  let totalBytes = 0;
+function firstValue(source, names) {
+  for (const name of names) {
+    const value = source?.[name];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return '';
+}
 
+function safeEqual(left, right) {
+  const leftBuffer = Buffer.from(left, 'utf8');
+  const rightBuffer = Buffer.from(right, 'utf8');
+  return leftBuffer.length === rightBuffer.length &&
+    crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function verifyBodyHmac(rawBody, signature, secret) {
+  const hex = signature.replace(/^sha256=/i, '').trim();
+  if (!/^[a-f0-9]{64}$/i.test(hex)) return false;
+  const provided = Buffer.from(hex, 'hex');
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest();
+  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
+}
+
+async function readPostBody(req) {
+  const chunks = [];
+  let size = 0;
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    totalBytes += buffer.length;
-    if (totalBytes > MAX_BODY_BYTES) {
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) {
       const error = new Error('Request body too large');
       error.statusCode = 413;
       throw error;
@@ -45,38 +68,17 @@ async function readRawBody(req) {
     chunks.push(buffer);
   }
 
-  return Buffer.concat(chunks, totalBytes);
-}
+  const rawBody = Buffer.concat(chunks, size);
+  if (rawBody.length === 0) return { rawBody, payload: req.body || {} };
 
-function getSignature(req) {
-  const value = req.headers?.['x-pubscale-signature'] ||
-    req.headers?.['x-signature'];
-  if (Array.isArray(value)) return value[0] || '';
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function verifySignature(rawBody, suppliedSignature, secret) {
-  const signatureHex = suppliedSignature.replace(/^sha256=/i, '').trim();
-  if (!/^[a-f0-9]{64}$/i.test(signatureHex)) return false;
-
-  const suppliedDigest = Buffer.from(signatureHex, 'hex');
-  const expectedDigest = crypto
-    .createHmac('sha256', secret)
-    .update(rawBody)
-    .digest();
-
-  return suppliedDigest.length === expectedDigest.length &&
-    crypto.timingSafeEqual(suppliedDigest, expectedDigest);
-}
-
-function parsePayload(rawBody, contentType = '') {
-  const type = contentType.toLowerCase();
-  const text = rawBody.toString('utf8');
-
-  if (type.includes('application/x-www-form-urlencoded')) {
-    return Object.fromEntries(new URLSearchParams(text));
+  const contentType = req.headers?.['content-type']?.toLowerCase() || '';
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    return {
+      rawBody,
+      payload: Object.fromEntries(new URLSearchParams(rawBody.toString('utf8'))),
+    };
   }
-  if (!type.includes('application/json') && !type.includes('+json')) {
+  if (!contentType.includes('application/json') && !contentType.includes('+json')) {
     const error = new Error('Unsupported content type');
     error.statusCode = 415;
     throw error;
@@ -84,7 +86,7 @@ function parsePayload(rawBody, contentType = '') {
 
   let payload;
   try {
-    payload = JSON.parse(text);
+    payload = JSON.parse(rawBody.toString('utf8'));
   } catch (_) {
     const error = new Error('Malformed JSON body');
     error.statusCode = 400;
@@ -95,47 +97,65 @@ function parsePayload(rawBody, contentType = '') {
     error.statusCode = 400;
     throw error;
   }
-  return payload;
-}
-
-function firstValue(source, names) {
-  for (const name of names) {
-    const value = source?.[name];
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  }
-  return '';
+  return { rawBody, payload };
 }
 
 module.exports = async function pubscalePostback(req, res) {
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    res.setHeader('Allow', 'GET, POST');
     return respond(res, 405, { ok: false, error: 'method_not_allowed' });
   }
 
-  const signatureSecret = process.env.PUBSCALE_POSTBACK_SECRET || '';
-  if (!signatureSecret) {
-    logOutcome('configuration_error', { reason: 'signature_secret_missing' });
+  const expectedToken = process.env.PUBSCALE_POSTBACK_TOKEN || '';
+  const hmacSecret = process.env.PUBSCALE_POSTBACK_SECRET || '';
+  if (!expectedToken && !hmacSecret) {
+    logOutcome('configuration_error', { reason: 'postback_secret_missing' });
     return respond(res, 500, { ok: false, error: 'server_misconfigured' });
   }
 
   try {
-    const rawBody = await readRawBody(req);
-    const signature = getSignature(req);
-    if (!signature || !verifySignature(rawBody, signature, signatureSecret)) {
-      logOutcome('rejected', {
-        reason: 'invalid_signature',
-        signatureProvided: Boolean(signature),
-      });
-      return respond(res, 401, { ok: false, error: 'invalid_signature' });
+    const query = req.query || {};
+    let body = req.body && typeof req.body === 'object' ? req.body : {};
+    let rawBody = Buffer.alloc(0);
+    if (req.method === 'POST') {
+      const parsed = await readPostBody(req);
+      body = parsed.payload;
+      rawBody = parsed.rawBody;
     }
 
-    const payload = parsePayload(rawBody, req.headers?.['content-type'] || '');
-    const userId = firstValue(payload, ['user_id', 'userId', 'uid']);
-    const transactionId = firstValue(payload, [
+    const authNames = ['token', 'tokan', 'auth_token', 'secret', 'signature'];
+    const credentialCandidates = authNames.flatMap((name) => [
+      firstValue(body, [name]),
+      firstValue(query, [name]),
+    ]).filter(Boolean);
+    const headerSignature = firstValue(req.headers, [
+      'x-pubscale-signature', 'x-signature',
+    ]).replace(/^sha256=/i, '').trim();
+    const bearerToken = (req.headers?.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1] || '';
+    const sharedCredentialValid = credentialCandidates.some((credential) =>
+      safeEqual(credential, expectedToken));
+    const hmacHeaderValid = req.method === 'POST' && headerSignature &&
+      hmacSecret && verifyBodyHmac(rawBody, headerSignature, hmacSecret);
+
+    if (!sharedCredentialValid && !hmacHeaderValid && !safeEqual(bearerToken, expectedToken)) {
+      logOutcome('rejected', {
+        reason: 'unauthorized',
+        credentialProvided: Boolean(credentialCandidates.length || headerSignature || bearerToken),
+        credentialConfigured: Boolean(expectedToken || hmacSecret),
+      });
+      return respond(res, 401, { ok: false, error: 'unauthorized' });
+    }
+
+    const userId = firstValue(body, ['user_id', 'userId', 'uid']) ||
+      firstValue(query, ['user_id', 'userId', 'uid']);
+    const transactionId = firstValue(body, [
+      'transaction_id', 'transactionId', 'trans_id', 'tx_id', 'id',
+    ]) || firstValue(query, [
       'transaction_id', 'transactionId', 'trans_id', 'tx_id', 'id',
     ]);
-    const rewardValue = firstValue(payload, [
+    const rewardValue = firstValue(body, [
+      'value', 'reward', 'coins', 'amount', 'reward_value',
+    ]) || firstValue(query, [
       'value', 'reward', 'coins', 'amount', 'reward_value',
     ]);
     const rewardCoins = Number(rewardValue);
